@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Buffers;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -96,6 +97,11 @@ namespace Parquet.Encodings {
             } else if(t == typeof(byte[][])) {
                 Span<byte[]> span = ((byte[][])data).AsSpan(offset, count);
                 Encode(span, destination);
+            } else if(t == typeof(DateTimeOffset[])) {
+                Span<DateTimeOffset> span = ((DateTimeOffset[])data).AsSpan(offset, count);
+                Encode(span, destination, tse);
+                if(stats != null)
+                    FillStats(span, stats);
             } else if(t == typeof(DateTime[])) {
                 Span<DateTime> span = ((DateTime[])data).AsSpan(offset, count);
                 Encode(span, destination, tse);
@@ -184,6 +190,9 @@ namespace Parquet.Encodings {
             } else if(t == typeof(byte[][])) {
                 Span<byte[]> span = ((byte[][])data).AsSpan(offset, count);
                 elementsRead = Decode(source, span, tse);
+            } else if(t == typeof(DateTimeOffset[])) {
+                Span<DateTimeOffset> span = ((DateTimeOffset[])data).AsSpan(offset, count);
+                elementsRead = Decode(source, span, tse);
             } else if(t == typeof(DateTime[])) {
                 Span<DateTime> span = ((DateTime[])data).AsSpan(offset, count);
                 elementsRead = Decode(source, span, tse);
@@ -263,6 +272,8 @@ namespace Parquet.Encodings {
             } else if(t == typeof(byte[])) {
                 result = (byte[])value;
                 return true;
+            } else if(t == typeof(DateTimeOffset)) {
+                return TryEncode((DateTimeOffset)value, tse, out result);
             } else if(t == typeof(DateTime))
                 return TryEncode((DateTime)value, tse, out result);
 #if NET6_0_OR_GREATER
@@ -352,6 +363,18 @@ namespace Parquet.Encodings {
             }
         }
 
+        private static bool TryEncode(DateTimeOffset value, SchemaElement tse, out byte[] result) {
+            switch(tse.Type) {
+                case TType.INT64:
+                    long unixTime = value.ToUniversalTime().ToUnixTimeMilliseconds();
+                    result = BitConverter.GetBytes(unixTime);
+                    return true;
+                default:
+                    throw new InvalidDataException($"data type '{tse.Type}' does not represent any date types");
+
+            }
+        }
+        
         private static bool TryEncode(DateTime value, SchemaElement tse, out byte[] result) {
             switch(tse.Type) {
                 case TType.INT32:
@@ -811,6 +834,40 @@ namespace Parquet.Encodings {
             return read;
         }
 
+        public static void Encode(ReadOnlySpan<DateTimeOffset> data, Stream destination, SchemaElement tse) {
+            switch(tse.Type) {
+                case TType.INT64:
+                    if(tse.LogicalType?.TIMESTAMP is not null) {
+                        foreach(DateTimeOffset element in data) {
+                            if(tse.LogicalType.TIMESTAMP.Unit.MILLIS is not null) {
+                                // Always convert to UTC
+                                long unixTime = element.ToUniversalTime().DateTime.ToUnixMilliseconds();
+                                byte[] raw = BitConverter.GetBytes(unixTime);
+                                destination.Write(raw, 0, raw.Length);    
+#if NET7_0_OR_GREATER
+                            } else if (tse.LogicalType.TIMESTAMP.Unit.MICROS is not null) {
+                                long unixTime = element.ToUniversalTime().DateTime.ToUnixMicroseconds();
+                                byte[] raw = BitConverter.GetBytes(unixTime);
+                                destination.Write(raw, 0, raw.Length);
+                            } else if (tse.LogicalType.TIMESTAMP.Unit.NANOS is not null) {
+                                long unixTime = element.ToUniversalTime().DateTime.ToUnixNanoseconds();
+                                byte[] raw = BitConverter.GetBytes(unixTime);
+                                destination.Write(raw, 0, raw.Length);
+#endif
+                            } else {
+                                throw new ParquetException($"Unexpected TimeUnit: {tse.LogicalType.TIMESTAMP.Unit}");
+                            }
+                        }
+                    } else {
+                        throw new ArgumentException($"invalid converted type: {tse.ConvertedType}");
+                    }
+                    break;
+                default:
+                    throw new InvalidDataException($"data type '{tse.Type}' does not represent any date types");
+
+            }
+        }
+        
         public static void Encode(ReadOnlySpan<DateTime> data, Stream destination, SchemaElement tse) {
 
             switch(tse.Type) {
@@ -822,7 +879,27 @@ namespace Parquet.Encodings {
                     }
                     break;
                 case TType.INT64:
-                    if(tse.ConvertedType == ConvertedType.TIMESTAMP_MILLIS) {
+                    if(tse.LogicalType?.TIMESTAMP is not null) {
+                        foreach(DateTime element in data) {
+                            if(tse.LogicalType.TIMESTAMP.Unit.MILLIS is not null) {
+                                long unixTime = element.ToUnixMilliseconds();
+                                byte[] raw = BitConverter.GetBytes(unixTime);
+                                destination.Write(raw, 0, raw.Length);    
+#if NET7_0_OR_GREATER
+                            } else if (tse.LogicalType.TIMESTAMP.Unit.MICROS is not null) {
+                                long unixTime = element.ToUtc().ToUnixMicroseconds();
+                                byte[] raw = BitConverter.GetBytes(unixTime);
+                                destination.Write(raw, 0, raw.Length);
+                            } else if (tse.LogicalType.TIMESTAMP.Unit.NANOS is not null) {
+                                long unixTime = element.ToUtc().ToUnixNanoseconds();
+                                byte[] raw = BitConverter.GetBytes(unixTime);
+                                destination.Write(raw, 0, raw.Length);
+#endif
+                            } else {
+                                throw new ParquetException($"Unexpected TimeUnit: {tse.LogicalType.TIMESTAMP.Unit}");
+                            }
+                        }
+                    } else if(tse.ConvertedType == ConvertedType.TIMESTAMP_MILLIS) {
                         foreach(DateTime element in data) {
                             long unixTime = element.ToUtc().ToUnixMilliseconds();
                             byte[] raw = BitConverter.GetBytes(unixTime);
@@ -879,6 +956,41 @@ namespace Parquet.Encodings {
             }
         }
 #endif
+        public static int Decode(Span<byte> source, Span<DateTimeOffset> data, SchemaElement tse) {
+            switch(tse.Type) {
+                case TType.INT64:
+                    long[] longs = ArrayPool<long>.Shared.Rent(data.Length);
+                    try {
+                        int longsRead = Decode(source, longs.AsSpan(0, data.Length));
+                        if(tse.LogicalType?.TIMESTAMP is not null) {
+                            for(int i = 0; i < longsRead; i++) {
+                                if(tse.LogicalType.TIMESTAMP.Unit.MILLIS is not null) {
+                                    data[i] = DateTimeOffset.FromUnixTimeMilliseconds(longs[i]);
+                                } else if(tse.LogicalType.TIMESTAMP.Unit.MICROS is not null) {
+                                    long lv = longs[i];
+                                    long microseconds = lv % 1000;
+                                    lv /= 1000;
+                                    data[i] = DateTimeOffset.FromUnixTimeMilliseconds(lv).AddTicks(microseconds * 10);
+                                } else if(tse.LogicalType.TIMESTAMP.Unit.NANOS is not null) {
+                                    long lv = longs[i];
+                                    long nanoseconds = lv % 1000000;
+                                    lv /= 1000000;;
+                                    data[i] = DateTimeOffset.FromUnixTimeMilliseconds(lv).AddTicks(nanoseconds / 100); // 1 tick = 100 nanoseconds;
+                                } else {
+                                    throw new ParquetException($"Unexpected TimeUnit: {tse.LogicalType.TIMESTAMP.Unit}");
+                                }
+                            }
+                        } else {
+                            throw new ArgumentException("");
+                        }
+                        return longsRead;
+                    } finally {
+                        ArrayPool<long>.Shared.Return(longs);
+                    }
+                default:
+                    throw new NotSupportedException();
+            }
+        }
 
         public static int Decode(Span<byte> source, Span<DateTime> data, SchemaElement tse) {
             switch(tse.Type) {
@@ -896,7 +1008,31 @@ namespace Parquet.Encodings {
                     long[] longs = ArrayPool<long>.Shared.Rent(data.Length);
                     try {
                         int longsRead = Decode(source, longs.AsSpan(0, data.Length));
-                        if(tse.ConvertedType == ConvertedType.TIMESTAMP_MICROS) {
+                        if(tse.LogicalType?.TIMESTAMP is not null) {
+                            for(int i = 0; i < longsRead; i++) {
+                                if(tse.LogicalType.TIMESTAMP.Unit.MILLIS is not null) {
+                                    DateTime dt = longs[i].AsUnixMillisecondsInDateTime();
+                                    dt = DateTime.SpecifyKind(dt, tse.LogicalType.TIMESTAMP.IsAdjustedToUTC ? DateTimeKind.Utc : DateTimeKind.Local);
+                                    data[i] = dt;
+                                } else if(tse.LogicalType.TIMESTAMP.Unit.MICROS is not null) {
+                                    long lv = longs[i];
+                                    long microseconds = lv % 1000;
+                                    lv /= 1000;
+                                    DateTime dt = lv.AsUnixMillisecondsInDateTime().AddTicks(microseconds * 10);
+                                    dt = DateTime.SpecifyKind(dt, tse.LogicalType.TIMESTAMP.IsAdjustedToUTC ? DateTimeKind.Utc : DateTimeKind.Local);
+                                    data[i] = dt;
+                                } else if(tse.LogicalType.TIMESTAMP.Unit.NANOS is not null) {
+                                    long lv = longs[i];
+                                    long nanoseconds = lv % 1000000;
+                                    lv /= 1000000;
+                                    DateTime dt = lv.AsUnixMillisecondsInDateTime().AddTicks(nanoseconds / 100); // 1 tick = 100 nanoseconds
+                                    dt = DateTime.SpecifyKind(dt, tse.LogicalType.TIMESTAMP.IsAdjustedToUTC ? DateTimeKind.Utc : DateTimeKind.Local);
+                                    data[i] = dt;
+                                } else {
+                                    throw new ParquetException($"Unexpected TimeUnit: {tse.LogicalType.TIMESTAMP.Unit}");
+                                }
+                            }
+                        } else if(tse.ConvertedType == ConvertedType.TIMESTAMP_MICROS) {
                             for(int i = 0; i < longsRead; i++) {
                                 long lv = longs[i];
                                 long microseconds = lv % 1000;
@@ -1253,6 +1389,12 @@ namespace Parquet.Encodings {
             stats.MaxValue = max;
         }
 
+        public static void FillStats(ReadOnlySpan<DateTimeOffset> data, DataColumnStatistics stats) {
+            data.MinMax(out DateTimeOffset min, out DateTimeOffset max);
+            stats.MinValue = min;
+            stats.MaxValue = max;
+        }
+        
         public static void FillStats(ReadOnlySpan<DateTime> data, DataColumnStatistics stats) {
             data.MinMax(out DateTime min, out DateTime max);
             stats.MinValue = min;
