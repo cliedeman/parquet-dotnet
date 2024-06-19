@@ -142,6 +142,12 @@ namespace Parquet.Serialization {
                     isAdjustedToUTC: tsa == null ? true : tsa.IsAdjustedToUTC,
                     unit: tsa?.Resolution.Convert(),
                     isNullable: t == typeof(DateTime?), null, propertyName);
+            } else if (t == typeof(DateTimeOffset) || t == typeof(DateTimeOffset?)) {
+                ParquetTimestampAttribute? tsa = member?.TimestampAttribute;
+                r = new DateTimeOffsetDataField(name,
+                    isAdjustedToUTC: tsa == null ? true : tsa.IsAdjustedToUTC,
+                    unit: tsa?.Resolution.Convert(),
+                    isNullable: t == typeof(DateTimeOffset?), null, propertyName);
             } else if(t == typeof(TimeSpan) || t == typeof(TimeSpan?)) {
                 r = new TimeSpanDataField(name,
                     member?.MicroSecondsTimeAttribute == null
